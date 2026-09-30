@@ -5,6 +5,7 @@ import {
   useLocation,
   Link,
   NavLink,
+  Navigate,
   Routes,
   Route
 } from 'react-router-dom';
@@ -40,7 +41,7 @@ import {
 
 const API =
   import.meta.env.VITE_API_URL ||
-  'http://localhost:4000/api';
+  '/api';
 
 const money = (n) =>
   new Intl.NumberFormat('id-ID', {
@@ -214,6 +215,11 @@ function App() {
           );
 
           setProfile(p);
+            if (p.role === 'cashier') {
+              window.location.href = '/kasir';
+            } else {
+              window.location.href = '/';
+  }
         }}
       />
     );
@@ -1745,6 +1751,7 @@ function CustomerCart({
           latitude:profile.latitude ?? null,
           longitude:profile.longitude ?? null,
           orderNotes:orderNotes.trim() || null,
+          salesChannel:'website',
           paymentMethod,
           items:entries.map((item) => ({
             menuId:item.menu.id,
@@ -2842,6 +2849,15 @@ function CashierApp({
             }
           />
 
+          <Route
+            path="*"
+            element={
+              <Navigate
+                to="/kasir"
+                replace
+              />
+            }
+          />
         </Routes>
 
       </main>
@@ -4610,6 +4626,7 @@ function ManualOrder({
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
   const [orderNotes, setOrderNotes] = useState('');
+  const [salesChannel, setSalesChannel] = useState('offline');
   const [method, setMethod] = useState('cash');
   const [saving, setSaving] = useState(false);
 
@@ -4713,6 +4730,7 @@ function ManualOrder({
               phone || null,
             orderNotes:
               orderNotes.trim() || null,
+            salesChannel,
             paymentMethod: method,
             paymentStatus: 'paid',
             items: entries.map((item) => {
@@ -4741,6 +4759,7 @@ function ManualOrder({
       setName('');
       setPhone('');
       setOrderNotes('');
+      setSalesChannel('offline');
       setMethod('cash');
     } catch (error) {
       show(
@@ -4939,6 +4958,42 @@ function ManualOrder({
               <small>
                 Catatan berlaku untuk seluruh pesanan.
               </small>
+            </div>
+
+            <div>
+              <span className="form-caption">
+                Sumber Penjualan
+              </span>
+
+              <div className="payment-grid">
+                <button
+                  type="button"
+                  className={
+                    salesChannel === 'offline'
+                      ? 'selected'
+                      : ''
+                  }
+                  onClick={() =>
+                    setSalesChannel('offline')
+                  }
+                >
+                  OFFLINE
+                </button>
+
+                <button
+                  type="button"
+                  className={
+                    salesChannel === 'shopeefood'
+                      ? 'selected'
+                      : ''
+                  }
+                  onClick={() =>
+                    setSalesChannel('shopeefood')
+                  }
+                >
+                  SHOPEEFOOD
+                </button>
+              </div>
             </div>
 
             <div>

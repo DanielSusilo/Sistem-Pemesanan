@@ -299,6 +299,14 @@ const orderSchema =
         .optional()
         .nullable(),
 
+    salesChannel:
+      z.enum([
+        'website',
+        'offline',
+        'shopeefood'
+      ])
+      .default('website'),
+
     paymentMethod:
       z.enum([
         'cash',
@@ -325,6 +333,13 @@ const manualOrderSchema =
         .uuid()
         .optional()
         .nullable(),
+
+    salesChannel:
+      z.enum([
+        'offline',
+        'shopeefood'
+      ])
+      .default('offline'),
 
     paymentStatus:
       z.literal(
@@ -1661,14 +1676,12 @@ app.post(
     res,
     next
   ) => {
-
     try {
 
       const parsed =
         orderSchema.safeParse(
           req.body
         );
-
 
       if (!parsed.success) {
         return res
@@ -1682,7 +1695,6 @@ app.post(
           });
       }
 
-
       const {
         customerName,
         customerPhone,
@@ -1692,103 +1704,32 @@ app.post(
         orderNotes,
         paymentMethod,
         items
-      } =
-        parsed.data;
+      } = parsed.data;
 
+      /*
+       * CUSTOMER CHECKOUT
+       *
+       * Semua transaksi yang dibuat
+       * dari halaman customer otomatis
+       * masuk sebagai WEBSITE.
+       */
+      const finalSalesChannel =
+        'website';
 
+      /*
+       * Ambil data menu dari database.
+       * Harga TIDAK diambil dari frontend.
+       */
       const map =
         await menuMap(
           req.db,
           items
         );
 
-
-      const {
-        data: order,
-        error: orderError
-      } =
-        await req.db
-          .from(
-            'orders'
-          )
-          .insert({
-            customer_id:
-              req.user.id,
-
-            customer_name:
-              customerName ||
-              req.profile
-                .full_name,
-
-            customer_phone:
-              customerPhone ||
-              req.profile
-                .phone ||
-              null,
-
-            address:
-              address ||
-              req.profile
-                .address ||
-              null,
-
-            latitude:
-              latitude ??
-              req.profile
-                .latitude ??
-              null,
-
-            longitude:
-              longitude ??
-              req.profile
-                .longitude ??
-              null,
-
-            order_notes:
-              orderNotes ||
-              null,
-
-            payment_method:
-              paymentMethod,
-
-            payment_status:
-              'pending',
-
-            status:
-              'pending',
-
-            total:
-              0
-          })
-          .select(`
-            id,
-            order_code,
-            customer_id,
-            customer_name,
-            customer_phone,
-            address,
-            latitude,
-            longitude,
-            order_notes,
-            total,
-            payment_method,
-            payment_status,
-            status,
-            ordered_at
-          `)
-          .single();
-
-
-      if (orderError) {
-        return res
-          .status(400)
-          .json({
-            error:
-              orderError.message
-          });
-      }
-
-
+      /*
+       * Buat order_items terlebih dahulu
+       * di memory dan hitung total langsung.
+       */
       const orderItems =
         items.map(
           (item) => {
@@ -1804,19 +1745,19 @@ app.post(
                 ?.name ===
               'Ayam Geprek';
 
-
             return {
-              order_id:
-                order.id,
-
               menu_id:
                 item.menuId,
 
               quantity:
-                item.quantity,
+                Number(
+                  item.quantity
+                ),
 
               unit_price:
-                menu.price,
+                Number(
+                  menu.price
+                ),
 
               spice_level:
                 isAyamGeprek
@@ -1827,25 +1768,194 @@ app.post(
                   : 'sedang',
 
               notes:
+                item.notes ||
                 null
             };
           }
         );
 
+      /*
+       * HITUNG TOTAL SEBELUM INSERT ORDER
+       *
+       * contoh:
+       * 22000 + 7000 + 5000
+       * = 34000
+       */
+      const total =
+        orderItems.reduce(
+          (sum, item) =>
+            sum +
+            (
+              Number(
+                item.unit_price || 0
+              ) *
+              Number(
+                item.quantity || 0
+              )
+            ),
+          0
+        );
 
+      /*
+       * Pastikan total valid.
+       */
+      if (
+        !Number.isFinite(total) ||
+        total <= 0
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'Total pesanan tidak valid.'
+          });
+      }
+
+      /*
+       * INSERT ORDER
+       *
+       * Total langsung diisi
+       * dengan hasil perhitungan.
+       *
+       * Customer:
+       * status = pending
+       * payment_status = pending
+       * sales_channel = website
+       */
+      const {
+        data: order,
+        error: orderError
+      } =
+        await req.db
+          .from('orders')
+          .insert({
+            customer_id:
+              req.user.id,
+
+            customer_name:
+              customerName ||
+              req.profile.full_name,
+
+            customer_phone:
+              customerPhone ||
+              req.profile.phone ||
+              null,
+
+            address:
+              address ||
+              req.profile.address ||
+              null,
+
+            latitude:
+              latitude ??
+              req.profile.latitude ??
+              null,
+
+            longitude:
+              longitude ??
+              req.profile.longitude ??
+              null,
+
+            order_notes:
+              orderNotes ||
+              null,
+
+            sales_channel:
+              finalSalesChannel,
+
+            payment_method:
+              paymentMethod,
+
+            payment_status:
+              'pending',
+
+            status:
+              'pending',
+
+            total:
+              total
+          })
+          .select(`
+            id,
+            order_code,
+            customer_id,
+            customer_name,
+            customer_phone,
+            address,
+            latitude,
+            longitude,
+            order_notes,
+            sales_channel,
+            total,
+            payment_method,
+            payment_status,
+            status,
+            ordered_at
+          `)
+          .single();
+
+      if (orderError) {
+        return res
+          .status(400)
+          .json({
+            error:
+              orderError.message
+          });
+      }
+
+      /*
+       * Tambahkan order_id setelah
+       * order utama berhasil dibuat.
+       */
+      const orderItemsWithOrderId =
+        orderItems.map(
+          (item) => ({
+            order_id:
+              order.id,
+
+            menu_id:
+              item.menu_id,
+
+            quantity:
+              item.quantity,
+
+            unit_price:
+              item.unit_price,
+
+            spice_level:
+              item.spice_level,
+
+            notes:
+              item.notes
+          })
+        );
+
+      /*
+       * INSERT ORDER ITEMS
+       */
       const {
         error: itemError
       } =
         await req.db
-          .from(
-            'order_items'
-          )
+          .from('order_items')
           .insert(
-            orderItems
+            orderItemsWithOrderId
           );
 
-
       if (itemError) {
+
+        /*
+         * Bersihkan order jika
+         * order_items gagal dibuat.
+         */
+        await req.db
+          .from('orders')
+          .delete()
+          .eq(
+            'id',
+            order.id
+          );
+
         return res
           .status(400)
           .json({
@@ -1854,85 +1964,50 @@ app.post(
           });
       }
 
-
- /* =========================================================
-   HITUNG TOTAL TRANSAKSI MANUAL
-========================================================= */
-
-const total =
-  orderItems.reduce(
-    (sum, item) =>
-      sum +
-      (
-        Number(
-          item.unit_price
-        ) *
-        Number(
-          item.quantity
-        )
-      ),
-    0
-  );
-
-
-const {
-  error: updateTotalError
-} =
-  await req.db
-    .from('orders')
-    .update({
-      total,
-      status:
-        'completed',
-      payment_status:
-        'paid',
-      cashier_id:
-        req.user.id,
-      updated_at:
-        new Date().toISOString()
-    })
-    .eq(
-      'id',
-      order.id
-    );
-
-
-if (
-  updateTotalError
-) {
-  return res
-    .status(400)
-    .json({
-      error:
-        updateTotalError.message
-    });
-}
-
-
+      /*
+       * AUDIT LOG
+       */
       await audit(
         req,
         'CREATE_ORDER',
         'orders',
         order.id,
         {
-          total,
+          total:
+            total,
+
+          sales_channel:
+            finalSalesChannel,
+
           source:
             'customer'
         }
       );
 
-
-      res
+      /*
+       * RESPONSE
+       */
+      return res
         .status(201)
         .json({
           ...order,
-          total
+
+          total:
+            total,
+
+          sales_channel:
+            finalSalesChannel,
+
+          status:
+            'pending',
+
+          payment_status:
+            'pending'
         });
 
     } catch (error) {
       next(error);
     }
-
   }
 );
 
@@ -2087,6 +2162,7 @@ app.post(
         latitude,
         longitude,
         orderNotes,
+        salesChannel,
         paymentMethod,
         items
       } =
@@ -2139,6 +2215,10 @@ app.post(
             order_notes:
               orderNotes ||
               null,
+
+            sales_channel:
+              salesChannel ||
+              'offline',
 
             payment_method:
               paymentMethod,
@@ -2370,6 +2450,7 @@ app.get(
             latitude,
             longitude,
             order_notes,
+            sales_channel,
             total,
             payment_method,
             payment_status,
