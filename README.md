@@ -1,4 +1,4 @@
-# GeprekFlow Project 1 — Sistem Pemesanan Ayam Geprek
+# Ayam Geprek Dapoer Sari — Sistem Pemesanan Ayam Geprek
 
 Project baru dengan dua role memakai satu database Supabase.
 

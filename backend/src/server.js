@@ -20,7 +20,8 @@ import { z } from 'zod';
 const {
   PORT = 4000,
   SUPABASE_URL,
-  SUPABASE_PUBLISHABLE_KEY
+  SUPABASE_PUBLISHABLE_KEY,
+  SUPABASE_SERVICE_ROLE_KEY
 } = process.env;
 
 if (
@@ -123,6 +124,20 @@ const supabase =
       }
     }
   );
+
+// Admin client (service_role) — bypasses RLS, used for auto-confirm & profile creation
+const supabaseAdmin = SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(
+      SUPABASE_URL,
+      SUPABASE_SERVICE_ROLE_KEY,
+      {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false
+        }
+      }
+    )
+  : null;
 
 
 const db =
@@ -413,6 +428,47 @@ const statusSchema =
 
 
 /* =========================================================
+   CATEGORY SCHEMA
+========================================================= */
+
+const categorySchema =
+  z.object({
+    name:
+      z.string()
+        .min(2, 'Nama kategori minimal 2 karakter')
+        .max(50, 'Nama kategori maksimal 50 karakter'),
+
+    slug:
+      z.string()
+        .max(60)
+        .optional()
+        .nullable(),
+
+    icon:
+      z.string()
+        .max(30)
+        .optional()
+        .nullable(),
+
+    isActive:
+      z.preprocess(
+        (value) =>
+          typeof value === 'boolean'
+            ? value
+            : String(value).toLowerCase() === 'true',
+        z.boolean()
+      ).default(true),
+
+    sortOrder:
+      z.coerce
+        .number()
+        .int()
+        .optional()
+        .default(0)
+  });
+
+
+/* =========================================================
    AUTH MIDDLEWARE
 ========================================================= */
 
@@ -490,27 +546,60 @@ async function auth(
         )
         .maybeSingle();
 
-    if (
-      profileError ||
-      !profile
-    ) {
-      return res
-        .status(403)
-        .json({
-          error:
-            'Profil pengguna belum tersedia.',
+    let userProfile = profile;
 
-          detail:
-            profileError?.message ||
-            null
-        });
+    if (!userProfile) {
+      const fallbackName =
+        userData.user.user_metadata?.full_name ||
+        userData.user.email?.split('@')[0] ||
+        'Pelanggan';
+
+      if (supabaseAdmin) {
+        const { data: adminCreated } = await supabaseAdmin
+          .from('profiles')
+          .upsert({
+            id: userData.user.id,
+            full_name: fallbackName,
+            role: 'customer'
+          }, { onConflict: 'id' })
+          .select('*')
+          .maybeSingle();
+
+        if (adminCreated) {
+          userProfile = adminCreated;
+        }
+      }
+
+      if (!userProfile) {
+        const { data: createdProfile } = await client
+          .from('profiles')
+          .insert({
+            id: userData.user.id,
+            full_name: fallbackName,
+            role: 'customer'
+          })
+          .select('*')
+          .maybeSingle();
+
+        userProfile = createdProfile || {
+          id: userData.user.id,
+          full_name: fallbackName,
+          phone: null,
+          address: null,
+          latitude: null,
+          longitude: null,
+          role: 'customer',
+          created_at: userData.user.created_at || new Date().toISOString()
+        };
+      }
     }
 
-    req.user =
-      userData.user;
+    if (userProfile) {
+      userProfile.role = userProfile.role === 'cashier' ? 'cashier' : 'customer';
+    }
 
-    req.profile =
-      profile;
+    req.user = userData.user;
+    req.profile = userProfile;
 
     req.db =
       client;
@@ -609,7 +698,7 @@ app.get(
     res.json({
       ok: true,
       service:
-        'geprekflow-project-1',
+        'Ayam Geprek Dapoer Sari',
       time:
         new Date()
           .toISOString()
@@ -624,110 +713,145 @@ app.get(
 
 app.post(
   '/api/auth/login',
-
-  async (
-    req,
-    res,
-    next
-  ) => {
+  async (req, res, next) => {
     try {
+      const email = String(req.body.email || '').trim().toLowerCase();
+      const password = String(req.body.password || '');
 
-      const parsed =
-        loginSchema.safeParse(
-          req.body
-        );
-
-      if (!parsed.success) {
-        return res
-          .status(400)
-          .json({
-            error:
-              'Email atau password tidak valid.'
-          });
+      if (!email || !password) {
+        return res.status(400).json({
+          error: 'Silakan isi email dan kata sandi.'
+        });
       }
 
-      const {
-        data,
-        error
-      } =
-        await supabase.auth
-          .signInWithPassword(
-            parsed.data
-          );
+      let { data, error } = await supabase.auth.signInWithPassword({
+        email,
+        password
+      });
 
       if (error) {
-        return res
-          .status(401)
-          .json({
-            error:
-              error.message
-          });
+        let msg = error.message || '';
+        let code = error.code || '';
+
+        if (code === 'email_not_confirmed' || msg.toLowerCase().includes('email not confirmed')) {
+          if (supabaseAdmin) {
+            try {
+              const { data: userList } = await supabaseAdmin.auth.admin.listUsers();
+              const foundUser = userList?.users?.find(u => u.email?.toLowerCase() === email.toLowerCase());
+              if (foundUser) {
+                await supabaseAdmin.auth.admin.updateUserById(foundUser.id, { email_confirm: true });
+                const retry = await supabase.auth.signInWithPassword({ email, password });
+                if (retry.data?.session) {
+                  data = retry.data;
+                  error = null;
+                }
+              }
+            } catch (autoErr) {
+              console.warn('Auto-confirm saat login gagal:', autoErr.message);
+            }
+          }
+        }
+
+        if (error) {
+          if (code === 'email_not_confirmed' || msg.toLowerCase().includes('email not confirmed')) {
+            return res.status(403).json({
+              code: 'email_not_confirmed',
+              error: 'Verifikasi email diperlukan. Silakan periksa kotak masuk atau spam email Anda untuk mengonfirmasi akun sebelum masuk.'
+            });
+          }
+
+          if (msg.toLowerCase().includes('invalid login credentials') || msg.toLowerCase().includes('invalid credentials')) {
+            return res.status(401).json({
+              error: 'Email atau kata sandi salah. Silakan periksa kembali kredensial Anda.'
+            });
+          }
+
+          return res.status(401).json({ error: msg });
+        }
       }
 
-      const client =
-        db(
-          data.session
-            .access_token
-        );
+      const client = db(data.session.access_token);
 
-      const {
-        data: profile,
-        error: profileError
-      } =
-        await client
-          .from(
-            'profiles'
-          )
-          .select(
-            `
-              id,
-              full_name,
-              phone,
-              address,
-              latitude,
-              longitude,
-              role,
-              created_at
-            `
-          )
-          .eq(
-            'id',
-            data.user.id
-          )
-          .single();
+      const { data: profile, error: profileError } = await client
+        .from('profiles')
+        .select(
+          `
+            id,
+            full_name,
+            phone,
+            address,
+            latitude,
+            longitude,
+            role,
+            created_at
+          `
+        )
+        .eq('id', data.user.id)
+        .maybeSingle();
 
-      if (
-        profileError ||
-        !profile
-      ) {
-        return res
-          .status(403)
-          .json({
-            error:
-              'Profil pengguna belum tersedia.',
+      let userProfile = profile;
 
-            detail:
-              profileError?.message ||
-              null
-          });
+      if (!userProfile) {
+        const fallbackName =
+          data.user.user_metadata?.full_name ||
+          email.split('@')[0] ||
+          'Pelanggan';
+
+        if (supabaseAdmin) {
+          const { data: adminCreated } = await supabaseAdmin
+            .from('profiles')
+            .upsert({
+              id: data.user.id,
+              full_name: fallbackName,
+              role: 'customer'
+            }, { onConflict: 'id' })
+            .select('*')
+            .maybeSingle();
+
+          if (adminCreated) {
+            userProfile = adminCreated;
+          }
+        }
+
+        if (!userProfile) {
+          const { data: createdProfile } = await client
+            .from('profiles')
+            .insert({
+              id: data.user.id,
+              full_name: fallbackName,
+              role: 'customer'
+            })
+            .select('*')
+            .maybeSingle();
+
+          userProfile = createdProfile || {
+            id: data.user.id,
+            full_name: fallbackName,
+            phone: null,
+            address: null,
+            latitude: null,
+            longitude: null,
+            role: 'customer',
+            created_at: data.user.created_at || new Date().toISOString()
+          };
+        }
+      }
+
+      // Registrasi dan akun selalu terdeteksi sebagai 1 peran tunggal: 'customer' (atau 'cashier' untuk staf)
+      if (userProfile) {
+        userProfile.role = userProfile.role === 'cashier' ? 'cashier' : 'customer';
       }
 
       res.json({
-        session:
-          data.session,
-
-        user:
-          data.user,
-
-        profile
+        session: data.session,
+        user: data.user,
+        profile: userProfile
       });
-
     } catch (error) {
       next(error);
     }
   }
 );
-
 
 /* =========================================================
    REGISTER
@@ -735,80 +859,230 @@ app.post(
 
 app.post(
   '/api/auth/signup',
-
-  async (
-    req,
-    res,
-    next
-  ) => {
+  async (req, res, next) => {
     try {
+      const email = String(req.body.email || '').trim().toLowerCase();
+      const fullName = String(req.body.fullName || '').trim();
+      const password = String(req.body.password || '');
 
-      const parsed =
-        signupSchema.safeParse(
-          req.body
-        );
-
-      if (!parsed.success) {
-        return res
-          .status(400)
-          .json({
-            error:
-              'Data registrasi tidak valid.'
-          });
+      if (!fullName || fullName.length < 2) {
+        return res.status(400).json({
+          error: 'Nama lengkap minimal 2 karakter.'
+        });
       }
 
-      const {
-        data,
-        error
-      } =
-        await supabase.auth
-          .signUp({
-            email:
-              parsed.data.email,
-
-            password:
-              parsed.data.password,
-
-            options: {
-              data: {
-                full_name:
-                  parsed.data
-                    .fullName
-              }
-            }
-          });
-
-      if (error) {
-        return res
-          .status(400)
-          .json({
-            error:
-              error.message
-          });
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!email || !emailRegex.test(email)) {
+        return res.status(400).json({
+          error: 'Format email tidak valid.'
+        });
       }
 
-      res
-        .status(201)
-        .json({
+      if (!password || password.length < 6) {
+        return res.status(400).json({
+          error: 'Kata sandi minimal 6 karakter.'
+        });
+      }
 
-          session:
-            data.session,
+      // --- Step 1: Daftarkan user ---
+      let userId;
+      let userData = null;
+      let initialSession = null;
 
-          user:
-            data.user,
-
-          message:
-            data.session
-              ? 'Registrasi berhasil.'
-              : 'Registrasi berhasil. Periksa email jika verifikasi diaktifkan.'
+      if (supabaseAdmin) {
+        // Jika ada service role key, langsung buat user dengan email_confirm: true
+        const { data: adminUser, error: adminCreateError } = await supabaseAdmin.auth.admin.createUser({
+          email,
+          password,
+          email_confirm: true,
+          user_metadata: { full_name: fullName }
         });
 
+        if (adminCreateError) {
+          let msg = adminCreateError.message || '';
+          if (msg.toLowerCase().includes('already registered') || msg.toLowerCase().includes('already exists') || msg.toLowerCase().includes('unique')) {
+            msg = 'Email ini sudah terdaftar. Silakan masuk menggunakan kata sandi Anda.';
+          }
+          return res.status(400).json({ error: msg });
+        }
+
+        userData = adminUser.user;
+        userId = userData.id;
+
+        // Auto-create profil di public.profiles via admin (bypass RLS)
+        await supabaseAdmin
+          .from('profiles')
+          .upsert({
+            id: userId,
+            full_name: fullName,
+            role: 'customer'
+          }, { onConflict: 'id' });
+      } else {
+        // Standard signUp
+        const { data: signupData, error: signupError } = await supabase.auth.signUp({
+          email,
+          password,
+          options: {
+            data: { full_name: fullName }
+          }
+        });
+
+        if (signupError) {
+          let msg = signupError.message || '';
+          if (msg.toLowerCase().includes('rate limit')) {
+            msg = 'Batas pengiriman email verifikasi tercapai untuk sementara. Silakan coba lagi beberapa saat lagi.';
+          } else if (msg.toLowerCase().includes('already registered')) {
+            msg = 'Email ini sudah terdaftar. Silakan masuk menggunakan kata sandi Anda.';
+          }
+          return res.status(400).json({ error: msg });
+        }
+
+        if (signupData.user && (!signupData.user.identities || signupData.user.identities.length === 0)) {
+          return res.status(400).json({
+            error: 'Email ini sudah terdaftar. Silakan masuk menggunakan kata sandi Anda.'
+          });
+        }
+
+        userData = signupData.user;
+        userId = userData.id;
+        initialSession = signupData.session;
+      }
+
+      // --- Step 2: Auto-confirm email jika admin tersedia tapi user dibuat via signup ---
+      if (supabaseAdmin && userId) {
+        try {
+          await supabaseAdmin.auth.admin.updateUserById(userId, {
+            email_confirm: true
+          });
+        } catch (confirmErr) {
+          console.warn('Auto-confirm gagal (non-fatal):', confirmErr.message);
+        }
+      }
+
+      // --- Step 3: Login otomatis setelah registrasi ---
+      let session = initialSession;
+      let loggedUser = userData;
+
+      if (!session) {
+        const { data: loginData, error: loginError } = await supabase.auth.signInWithPassword({
+          email,
+          password
+        });
+
+        if (loginData?.session) {
+          session = loginData.session;
+          loggedUser = loginData.user || loggedUser;
+        } else if (loginError) {
+          const msg = loginError.message || '';
+          const code = loginError.code || '';
+          if (code === 'email_not_confirmed' || msg.toLowerCase().includes('email not confirmed')) {
+            return res.status(403).json({
+              code: 'email_not_confirmed',
+              session: null,
+              user: userData,
+              profile: null,
+              requiresEmailVerification: true,
+              error: 'Akun Anda berhasil tersimpan di Supabase! Namun verifikasi email masih aktif pada proyek Supabase. Silakan matikan toggle "Confirm email" di Supabase Dashboard (Authentication > Providers > Email) agar akun customer dapat langsung masuk ke dashboard.'
+            });
+          }
+          return res.status(400).json({ error: msg });
+        }
+      }
+
+      if (!session) {
+        return res.status(201).json({
+          session: null,
+          user: userData,
+          profile: null,
+          requiresEmailVerification: true,
+          message: 'Pendaftaran berhasil! Silakan periksa email Anda untuk verifikasi, lalu masuk menggunakan kata sandi yang telah didaftarkan.'
+        });
+      }
+
+      // --- Step 4: Ambil atau simpan profil customer ke DB ---
+      const client = db(session.access_token);
+      let { data: profile } = await client
+        .from('profiles')
+        .select('id, full_name, phone, address, latitude, longitude, role, created_at')
+        .eq('id', userId)
+        .maybeSingle();
+
+      if (!profile) {
+        const { data: createdProfile } = await client
+          .from('profiles')
+          .insert({
+            id: userId,
+            full_name: fullName,
+            role: 'customer'
+          })
+          .select('*')
+          .maybeSingle();
+
+        profile = createdProfile;
+      }
+
+      const userProfile = profile || {
+        id: userId,
+        full_name: fullName,
+        phone: null,
+        address: null,
+        latitude: null,
+        longitude: null,
+        role: 'customer',
+        created_at: loggedUser.created_at || new Date().toISOString()
+      };
+
+      // Registrasi akun baru selalu terdeteksi sebagai 1 peran tunggal saja: customer
+      userProfile.role = 'customer';
+
+      res.status(201).json({
+        session,
+        user: loggedUser,
+        profile: userProfile,
+        requiresEmailVerification: false,
+        message: 'Registrasi berhasil! Selamat datang di Ayam Geprek Dapoer Sari.'
+      });
     } catch (error) {
       next(error);
     }
   }
 );
 
+/* =========================================================
+   RESEND EMAIL VERIFICATION
+========================================================= */
+
+app.post(
+  '/api/auth/resend-verification',
+  async (req, res, next) => {
+    try {
+      const email = String(req.body.email || '').trim().toLowerCase();
+      if (!email) {
+        return res.status(400).json({ error: 'Alamat email wajib diisi.' });
+      }
+
+      const { data, error } = await supabase.auth.resend({
+        type: 'signup',
+        email
+      });
+
+      if (error) {
+        let msg = error.message || '';
+        if (msg.toLowerCase().includes('rate limit')) {
+          msg = 'Batas pengiriman email tercapai. Silakan tunggu beberapa saat lagi sebelum mencoba kembali.';
+        }
+        return res.status(400).json({ error: msg });
+      }
+
+      res.json({
+        ok: true,
+        message: 'Tautan verifikasi telah berhasil dikirim ulang ke ' + email + '. Silakan periksa kotak masuk atau folder spam email Anda.'
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 /* =========================================================
    CURRENT USER
@@ -941,55 +1215,508 @@ app.put(
 
 
 /* =========================================================
-   CATEGORIES
+   CATEGORIES (CUSTOMER + CASHIER MANAGEMENT)
 ========================================================= */
 
+// In-memory / dynamic metadata store for category fields (icon, slug, status, sortOrder)
+// if Supabase schema only stores (id, name, created_at)
+const categoryMetaStore = new Map();
+
+// Helper to generate a slug
+function toSlug(name) {
+  return String(name || '')
+    .toLowerCase()
+    .trim()
+    .replace(/[^\w\s-]/g, '')
+    .replace(/[\s_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+// 1. Customer categories (only active categories)
 app.get(
   '/api/categories',
   auth,
-
-  async (
-    req,
-    res,
-    next
-  ) => {
-
+  async (req, res, next) => {
     try {
-
-      const {
-        data,
-        error
-      } =
-        await req.db
-          .from(
-            'categories'
-          )
-          .select(
-            'id,name'
-          )
-          .order(
-            'name'
-          );
+      const { data, error } = await req.db
+        .from('categories')
+        .select('id, name')
+        .order('name');
 
       if (error) {
-        return res
-          .status(400)
-          .json({
-            error:
-              error.message
-          });
+        return res.status(400).json({ error: error.message });
       }
 
-      res.json(
-        data || []
-      );
+      // Enrich with metadata and filter active ones
+      const enriched = (data || []).map((cat) => {
+        const meta = categoryMetaStore.get(Number(cat.id)) || {};
+        return {
+          id: cat.id,
+          name: cat.name,
+          slug: meta.slug || toSlug(cat.name),
+          icon: meta.icon || 'Utensils',
+          status: meta.status || 'active',
+          sortOrder: typeof meta.sortOrder === 'number' ? meta.sortOrder : 0
+        };
+      }).filter((cat) => cat.status === 'active');
 
+      // Sort by sortOrder, then by name
+      enriched.sort((a, b) => (a.sortOrder - b.sortOrder) || a.name.localeCompare(b.name));
+
+      res.json(enriched);
     } catch (error) {
       next(error);
     }
-
   }
 );
+
+// 2. Cashier categories list (includes menuCount, active & inactive)
+app.get(
+  '/api/cashier/categories',
+  auth,
+  allow('cashier'),
+  async (req, res, next) => {
+    try {
+      const [catsRes, menuRes] = await Promise.all([
+        req.db.from('categories').select('id, name').order('name'),
+        req.db.from('menu').select('id, category_id')
+      ]);
+
+      if (catsRes.error) {
+        return res.status(400).json({ error: catsRes.error.message });
+      }
+
+      // Count menu items per category
+      const countMap = {};
+      (menuRes.data || []).forEach((m) => {
+        const cid = Number(m.category_id);
+        countMap[cid] = (countMap[cid] || 0) + 1;
+      });
+
+      const list = (catsRes.data || []).map((cat) => {
+        const meta = categoryMetaStore.get(Number(cat.id)) || {};
+        return {
+          id: cat.id,
+          name: cat.name,
+          slug: meta.slug || toSlug(cat.name),
+          icon: meta.icon || 'Utensils',
+          status: meta.status || 'active',
+          sortOrder: typeof meta.sortOrder === 'number' ? meta.sortOrder : 0,
+          menuCount: countMap[Number(cat.id)] || 0
+        };
+      });
+
+      list.sort((a, b) => (a.sortOrder - b.sortOrder) || a.name.localeCompare(b.name));
+
+      res.json(list);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// 3. Create category
+app.post(
+  '/api/cashier/categories',
+  auth,
+  allow('cashier'),
+  async (req, res, next) => {
+    try {
+      const parsed = categorySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          error: 'Data kategori tidak valid.',
+          details: parsed.error.flatten()
+        });
+      }
+
+      const { name, icon, slug, isActive, sortOrder } = parsed.data;
+
+      // Check duplicate name
+      const { data: existing } = await req.db
+        .from('categories')
+        .select('id, name')
+        .ilike('name', name.trim())
+        .maybeSingle();
+
+      if (existing) {
+        return res.status(400).json({
+          error: `Kategori "${name.trim()}" sudah ada.`
+        });
+      }
+
+      const { data, error } = await req.db
+        .from('categories')
+        .insert({ name: name.trim() })
+        .select('id, name')
+        .single();
+
+      if (error) {
+        return res.status(400).json({ error: error.message });
+      }
+
+      // Store metadata
+      const catId = Number(data.id);
+      const catSlug = slug ? toSlug(slug) : toSlug(data.name);
+      categoryMetaStore.set(catId, {
+        slug: catSlug,
+        icon: icon || 'Utensils',
+        status: isActive ? 'active' : 'inactive',
+        sortOrder: sortOrder || 0
+      });
+
+      await audit(req, 'CREATE_CATEGORY', 'categories', data.id, { name: data.name });
+
+      res.status(201).json({
+        id: data.id,
+        name: data.name,
+        slug: catSlug,
+        icon: icon || 'Utensils',
+        status: isActive ? 'active' : 'inactive',
+        sortOrder: sortOrder || 0,
+        menuCount: 0
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// 4. Update category
+app.put(
+  '/api/cashier/categories/:id',
+  auth,
+  allow('cashier'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id)) {
+        return res.status(400).json({ error: 'ID kategori tidak valid.' });
+      }
+
+      const parsed = categorySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          error: 'Data kategori tidak valid.',
+          details: parsed.error.flatten()
+        });
+      }
+
+      const { name, icon, slug, isActive, sortOrder } = parsed.data;
+
+      // Check if duplicate name on another category
+      const { data: duplicate } = await req.db
+        .from('categories')
+        .select('id')
+        .ilike('name', name.trim())
+        .neq('id', id)
+        .maybeSingle();
+
+      if (duplicate) {
+        return res.status(400).json({
+          error: `Kategori "${name.trim()}" sudah digunakan.`
+        });
+      }
+
+      const { data, error } = await req.db
+        .from('categories')
+        .update({ name: name.trim() })
+        .eq('id', id)
+        .select('id, name')
+        .single();
+
+      if (error) {
+        return res.status(400).json({ error: error.message });
+      }
+
+      const catSlug = slug ? toSlug(slug) : toSlug(data.name);
+      categoryMetaStore.set(id, {
+        slug: catSlug,
+        icon: icon || 'Utensils',
+        status: isActive ? 'active' : 'inactive',
+        sortOrder: sortOrder || 0
+      });
+
+      await audit(req, 'UPDATE_CATEGORY', 'categories', data.id, { name: data.name });
+
+      res.json({
+        id: data.id,
+        name: data.name,
+        slug: catSlug,
+        icon: icon || 'Utensils',
+        status: isActive ? 'active' : 'inactive',
+        sortOrder: sortOrder || 0
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// 5. Delete category with safety check
+app.delete(
+  '/api/cashier/categories/:id',
+  auth,
+  allow('cashier'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id)) {
+        return res.status(400).json({ error: 'ID kategori tidak valid.' });
+      }
+
+      // Check if category is used by any menu items
+      const { data: menuList, error: menuErr } = await req.db
+        .from('menu')
+        .select('id, name')
+        .eq('category_id', id);
+
+      if (menuErr) {
+        return res.status(400).json({ error: menuErr.message });
+      }
+
+      if (menuList && menuList.length > 0) {
+        return res.status(400).json({
+          error: `Tidak dapat menghapus kategori karena masih digunakan oleh ${menuList.length} menu. Silakan pindahkan menu ke kategori lain terlebih dahulu.`,
+          menuCount: menuList.length
+        });
+      }
+
+      const { error: delError } = await req.db
+        .from('categories')
+        .delete()
+        .eq('id', id);
+
+      if (delError) {
+        return res.status(400).json({ error: delError.message });
+      }
+
+      categoryMetaStore.delete(id);
+      await audit(req, 'DELETE_CATEGORY', 'categories', id);
+
+      res.json({ success: true, message: 'Kategori berhasil dihapus.' });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/* =========================================================
+   VARIATION GROUPS & OPTIONS (CUSTOMER + CASHIER)
+========================================================= */
+
+let variationGroupsStore = [
+  {
+    id: 'spice_level',
+    name: 'Level Pedas',
+    description: 'Pedasnya mau seberapa? 🌶',
+    type: 'single',
+    required: true,
+    status: 'active',
+    sortOrder: 1,
+    options: [
+      { id: 'tidak_pedas', name: 'Tidak Pedas', icon: '🌿', price: 0, desc: 'Tanpa sambal pedas', status: 'active', sortOrder: 1 },
+      { id: 'sedang', name: 'Sedang', icon: '🔥', price: 0, desc: 'Sedikit pedas, cocok semua', status: 'active', sortOrder: 2 },
+      { id: 'pedas', name: 'Pedas', icon: '🔥🔥', price: 1000, desc: 'Pedas nampol!', status: 'active', sortOrder: 3 },
+      { id: 'extra_pedas', name: 'Extra Pedas', icon: '🔥🔥🔥', price: 2000, desc: 'Berani pedas banget?', status: 'active', sortOrder: 4 },
+    ]
+  },
+  {
+    id: 'toppings',
+    name: 'Pilih Topping',
+    description: 'Tambah topping favoritmu!',
+    type: 'multiple',
+    required: false,
+    status: 'active',
+    sortOrder: 2,
+    options: [
+      { id: 'cheese', name: 'Keju', icon: '🧀', price: 4000, desc: '', status: 'active', sortOrder: 1 },
+      { id: 'mayonnaise', name: 'Mayonaise', icon: '🥛', price: 3000, desc: '', status: 'active', sortOrder: 2 },
+      { id: 'hot_lava', name: 'Hot Lava', icon: '🌋', price: 5000, desc: '', status: 'active', sortOrder: 3 },
+      { id: 'sambal_matah', name: 'Sambal Matah', icon: '🌶', price: 3000, desc: '', status: 'active', sortOrder: 4 },
+    ]
+  },
+  {
+    id: 'side_menus',
+    name: 'Menu Pendamping / Minuman',
+    description: 'Mau sekalian minum?',
+    type: 'single',
+    required: false,
+    status: 'active',
+    sortOrder: 3,
+    options: [
+      { id: 'iced_tea', name: 'Es Teh Manis', icon: '🧋', price: 5000, desc: '', status: 'active', sortOrder: 1 },
+      { id: 'orange_ice', name: 'Es Jeruk', icon: '🍊', price: 6000, desc: '', status: 'active', sortOrder: 2 },
+      { id: 'lemon_tea', name: 'Lemon Tea', icon: '🍋', price: 6000, desc: '', status: 'active', sortOrder: 3 },
+      { id: 'milo', name: 'Milo', icon: '🥛', price: 8000, desc: '', status: 'active', sortOrder: 4 },
+    ]
+  }
+];
+
+// Customer: get active variations
+app.get(
+  '/api/variations',
+  auth,
+  async (req, res) => {
+    try {
+      const activeGroups = variationGroupsStore
+        .filter(g => g.status === 'active')
+        .sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0))
+        .map(g => ({
+          ...g,
+          options: (g.options || [])
+            .filter(o => o.status === 'active')
+            .sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0))
+        }));
+      res.json(activeGroups);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// Cashier: get all variations
+app.get(
+  '/api/cashier/variations',
+  auth,
+  allow('cashier'),
+  async (req, res) => {
+    try {
+      res.json(variationGroupsStore);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// Cashier: create or update group
+app.post(
+  '/api/cashier/variations/group',
+  auth,
+  allow('cashier'),
+  async (req, res) => {
+    try {
+      const { id, name, description, type, required, status, sortOrder, options } = req.body;
+      if (!name || !name.trim()) {
+        return res.status(400).json({ error: 'Nama kelompok variasi wajib diisi.' });
+      }
+
+      const groupId = id || toSlug(name) || ('group_' + Date.now());
+      const existingIdx = variationGroupsStore.findIndex(g => g.id === groupId);
+
+      const groupData = {
+        id: groupId,
+        name: name.trim(),
+        description: description ? description.trim() : '',
+        type: type === 'multiple' ? 'multiple' : 'single',
+        required: Boolean(required),
+        status: status === 'inactive' ? 'inactive' : 'active',
+        sortOrder: Number(sortOrder) || (existingIdx >= 0 ? variationGroupsStore[existingIdx].sortOrder : variationGroupsStore.length + 1),
+        options: Array.isArray(options) ? options : (existingIdx >= 0 ? variationGroupsStore[existingIdx].options : [])
+      };
+
+      if (existingIdx >= 0) {
+        variationGroupsStore[existingIdx] = groupData;
+      } else {
+        variationGroupsStore.push(groupData);
+      }
+
+      await audit(req, existingIdx >= 0 ? 'UPDATE_VARIATION_GROUP' : 'CREATE_VARIATION_GROUP', 'variations', groupId, { name });
+      res.status(existingIdx >= 0 ? 200 : 201).json(groupData);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// Cashier: delete group
+app.delete(
+  '/api/cashier/variations/group/:id',
+  auth,
+  allow('cashier'),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      variationGroupsStore = variationGroupsStore.filter(g => g.id !== id);
+      await audit(req, 'DELETE_VARIATION_GROUP', 'variations', id);
+      res.json({ success: true, message: 'Kelompok variasi berhasil dihapus.' });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// Cashier: create or update option
+app.post(
+  '/api/cashier/variations/group/:groupId/option',
+  auth,
+  allow('cashier'),
+  async (req, res) => {
+    try {
+      const { groupId } = req.params;
+      const { id, name, icon, price, desc, status, sortOrder } = req.body;
+
+      const group = variationGroupsStore.find(g => g.id === groupId);
+      if (!group) {
+        return res.status(404).json({ error: 'Kelompok variasi tidak ditemukan.' });
+      }
+
+      if (!name || !name.trim()) {
+        return res.status(400).json({ error: 'Nama opsi variasi wajib diisi.' });
+      }
+
+      const optId = id || toSlug(name) || ('opt_' + Date.now());
+      if (!Array.isArray(group.options)) {
+        group.options = [];
+      }
+
+      const existingIdx = group.options.findIndex(o => o.id === optId);
+      const optData = {
+        id: optId,
+        name: name.trim(),
+        icon: icon || '✨',
+        price: Number(price) >= 0 ? Number(price) : 0,
+        desc: desc ? desc.trim() : '',
+        status: status === 'inactive' ? 'inactive' : 'active',
+        sortOrder: Number(sortOrder) || (existingIdx >= 0 ? group.options[existingIdx].sortOrder : group.options.length + 1)
+      };
+
+      if (existingIdx >= 0) {
+        group.options[existingIdx] = optData;
+      } else {
+        group.options.push(optData);
+      }
+
+      await audit(req, existingIdx >= 0 ? 'UPDATE_VARIATION_OPTION' : 'CREATE_VARIATION_OPTION', 'variations', optId, { groupId, name });
+      res.status(existingIdx >= 0 ? 200 : 201).json(optData);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// Cashier: delete option
+app.delete(
+  '/api/cashier/variations/group/:groupId/option/:optId',
+  auth,
+  allow('cashier'),
+  async (req, res) => {
+    try {
+      const { groupId, optId } = req.params;
+      const group = variationGroupsStore.find(g => g.id === groupId);
+      if (!group) {
+        return res.status(404).json({ error: 'Kelompok variasi tidak ditemukan.' });
+      }
+
+      group.options = (group.options || []).filter(o => o.id !== optId);
+      await audit(req, 'DELETE_VARIATION_OPTION', 'variations', optId, { groupId });
+      res.json({ success: true, message: 'Opsi variasi berhasil dihapus.' });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
 
 
 /* =========================================================
@@ -1561,6 +2288,69 @@ app.patch(
       next(error);
     }
 
+  }
+);
+
+/* =========================================================
+   DELETE MENU
+========================================================= */
+
+app.delete(
+  '/api/cashier/menu/:id',
+  auth,
+  allow('cashier'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id)) {
+        return res.status(400).json({ error: 'ID menu tidak valid.' });
+      }
+
+      // Check if menu is referenced in order_items
+      const { data: orderItemRef } = await req.db
+        .from('order_items')
+        .select('id')
+        .eq('menu_id', id)
+        .limit(1);
+
+      if (orderItemRef && orderItemRef.length > 0) {
+        // If already in order history, safely archive/deactivate rather than hard delete to preserve history
+        await req.db
+          .from('menu')
+          .update({ is_active: false, updated_at: new Date().toISOString() })
+          .eq('id', id);
+
+        await audit(req, 'ARCHIVE_MENU', 'menu', id, { reason: 'has_order_history' });
+
+        return res.json({
+          success: true,
+          message: 'Menu memiliki riwayat pesanan sehingga dinonaktifkan dari katalog.'
+        });
+      }
+
+      const { error: delErr } = await req.db
+        .from('menu')
+        .delete()
+        .eq('id', id);
+
+      if (delErr) {
+        // Fallback: if delete violates foreign key, deactivate
+        await req.db
+          .from('menu')
+          .update({ is_active: false, updated_at: new Date().toISOString() })
+          .eq('id', id);
+
+        return res.json({
+          success: true,
+          message: 'Menu memiliki riwayat pesanan sehingga dinonaktifkan dari katalog.'
+        });
+      }
+
+      await audit(req, 'DELETE_MENU', 'menu', id);
+      res.json({ success: true, message: 'Menu berhasil dihapus.' });
+    } catch (error) {
+      next(error);
+    }
   }
 );
 
